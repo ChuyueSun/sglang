@@ -31,13 +31,12 @@ from sglang.srt.speculative.eagle_utils import (
     EagleVerifyInput,
     EagleVerifyOutput,
     assign_draft_cache_locs,
-    fast_topk,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda_available
+from sglang.srt.utils import empty_context, fast_topk, get_available_gpu_memory, is_cuda
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
@@ -107,11 +106,12 @@ class EAGLEWorker(TpModelWorker):
         # Init draft worker
         with empty_context():
             super().__init__(
+                server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                server_args=server_args,
-                nccl_port=nccl_port,
+                pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
+                nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -201,7 +201,7 @@ class EAGLEWorker(TpModelWorker):
             self.has_prefill_wrapper_verify = False
         else:
             raise ValueError(
-                f"EAGLE is not supportted in attention backend {self.server_args.attention_backend}"
+                f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
             )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
@@ -245,8 +245,8 @@ class EAGLEWorker(TpModelWorker):
         Args:
             batch: The batch to run forward. The state of the batch is modified as it runs.
         Returns:
-            A tuple of the final logit output of the target model, next tokens accepeted,
-            the batch id (used for overlap schedule), and number of accepeted tokens.
+            A tuple of the final logit output of the target model, next tokens accepted,
+            the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_decode():
             with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -267,14 +267,11 @@ class EAGLEWorker(TpModelWorker):
             )
         elif batch.forward_mode.is_idle():
             model_worker_batch = batch.get_model_worker_batch()
-            logits_output, next_token_ids, _ = (
-                self.target_worker.forward_batch_generation(
-                    ForwardBatch.init_new(
-                        model_worker_batch, self.target_worker.model_runner
-                    )
-                )
+            logits_output, next_token_ids = self.target_worker.forward_batch_generation(
+                model_worker_batch
             )
-            return logits_output, next_token_ids, model_worker_batch.bid, 0, False
+
+            return logits_output, next_token_ids, model_worker_batch.bid, 0
         else:
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
@@ -494,11 +491,11 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Post process based on verified outputs.
-        # Pick indices that we care (accepeted)
+        # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepeted_indices
+            res.accepted_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepeted_indices]
+        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = ForwardMode.DECODE
@@ -600,7 +597,7 @@ class EAGLEWorker(TpModelWorker):
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        # Backup fileds that will be modified in-place
+        # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         req_pool_indices_backup = batch.req_pool_indices
         accept_length_backup = batch.spec_info.accept_length
